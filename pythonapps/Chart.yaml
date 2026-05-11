@@ -1,0 +1,12 @@
+apiVersion: v2
+name: pythonapps
+description: Chart maestro para apps Python FastAPI con ArgoRollouts y Tekton CI/CD.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - fastapi
+  - argo-rollouts
+  - tekton
+  - bluegreen
+  - canary

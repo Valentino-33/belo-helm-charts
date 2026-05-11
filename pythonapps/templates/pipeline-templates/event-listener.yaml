@@ -1,0 +1,49 @@
+# EventListener: recibe webhooks de GitHub y dispara el pipeline.
+# Filtro CEL: solo push de tags (refs/tags/*). Extrae el tag limpio en extensions.image_tag.
+# Expone Service ClusterIP; usar Ingress o port-forward para recibir webhooks externos.
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: github-tag-listener
+  namespace: tekton-pipelines
+spec:
+  serviceAccountName: tekton-triggers-sa
+  triggers:
+  - name: github-tag-push
+    interceptors:
+    - ref:
+        name: "cel"
+        kind: ClusterInterceptor
+      params:
+      - name: filter
+        value: "header.match('X-Github-Event', 'push') && body.ref.startsWith('refs/tags/')"
+      - name: overlays
+        value:
+        - key: image_tag
+          expression: "body.ref.split('/')[2]"
+    bindings:
+    - ref: github-tag-binding
+    template:
+      ref: pythonapps-trigger-template
+---
+# Ingress para recibir webhooks de GitHub (ajustar hostname al dominio real).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tekton-event-listener
+  namespace: tekton-pipelines
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: tekton-webhook.{{ .Values.ingress.hostname | default "localhost" }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: el-github-tag-listener
+            port:
+              number: 8080

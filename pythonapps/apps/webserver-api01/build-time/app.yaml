@@ -1,0 +1,21 @@
+# Valores fijos para webserver-api01 — no varían por ambiente.
+# Combinar con: helm template api01 pythonapps/ -f build-time/app.yaml -f <env>/values.yaml
+app:
+  name: webserver-api01
+  pathPrefix: api01
+  metricsPath: /api01/metrics
+
+rollout:
+  strategy: bluegreen
+
+image:
+  repository: docker.io/valentinobruno/api01
+  pullPolicy: IfNotPresent
+
+tekton:
+  dockerhubUser: valentinobruno
+  gitopsRepoUrl: https://github.com/Valentino-33/gitops-files
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
