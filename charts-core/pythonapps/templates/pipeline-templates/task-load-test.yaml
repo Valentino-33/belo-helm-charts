@@ -1,0 +1,78 @@
+# Corre k6 según la strategy del deploy y emite el resultado como Tekton result.
+# NUNCA falla el pipeline por sí solo: siempre exit 0, el outcome lo decide
+# la tarea promote-rollback que viene después.
+# Si los scripts no existen en src/loadtest/, loguea WARN y emite "passed".
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: run-load-test
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: app-name
+    type: string
+  - name: strategy
+    type: string
+    default: rollingupdate
+  - name: preview-url
+    default: ""
+    type: string
+    description: "URL del service preview — usada en BlueGreen (green) y Canary (canary pods)"
+  - name: base-url
+    default: ""
+    type: string
+    description: "URL del service stable — usada en RollingUpdate smoke test"
+  results:
+  - name: outcome
+    description: "'passed' si k6 terminó con exit 0, 'failed' si no. La tarea no falla el pipeline."
+  workspaces:
+  - name: source
+  steps:
+  - name: run-k6
+    image: grafana/k6:latest
+    script: |
+      #!/bin/sh
+      APP="$(params.app-name)"
+      STRATEGY="$(params.strategy)"
+      RESULT_FILE="/tekton/results/outcome"
+      echo "=== Load test: $APP (strategy: $STRATEGY) ==="
+
+      # Elige script y URL según la strategy.
+      # BlueGreen → preview service (green aislado, sin tráfico real).
+      # Canary     → preview service (canary pods, primer paso al 5%).
+      # Rolling    → stable service (tráfico activo, smoke post-deploy).
+      STRAT_LOWER=$(echo "$STRATEGY" | tr '[:upper:]' '[:lower:]')
+      case "$STRAT_LOWER" in
+        bluegreen)
+          SCRIPT="load-bluegreen.js"
+          TARGET_URL="$(params.preview-url)"
+          ;;
+        canary)
+          SCRIPT="load-canary.js"
+          TARGET_URL="$(params.preview-url)"
+          ;;
+        *)
+          SCRIPT="smoke.js"
+          TARGET_URL="$(params.base-url)"
+          ;;
+      esac
+
+      SCRIPT_PATH="$(workspaces.source.path)/src/loadtest/$SCRIPT"
+      if [ ! -f "$SCRIPT_PATH" ]; then
+        echo "WARN: $SCRIPT_PATH no existe — saltando load test, marcando como passed"
+        echo -n "passed" > "$RESULT_FILE"
+        exit 0
+      fi
+
+      k6 run -e TARGET_URL="$TARGET_URL" "$SCRIPT_PATH"
+      K6_EXIT=$?
+
+      if [ $K6_EXIT -eq 0 ]; then
+        echo -n "passed" > "$RESULT_FILE"
+        echo "=== Load test PASSED ==="
+      else
+        echo -n "failed" > "$RESULT_FILE"
+        echo "=== Load test FAILED (exit $K6_EXIT) — promote-rollback decidirá el rollback ==="
+      fi
+      # Siempre exit 0 para que Tekton no cancele el pipeline antes de promote-rollback.
+      exit 0

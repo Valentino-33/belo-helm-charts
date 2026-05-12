@@ -1,0 +1,72 @@
+# TriggerTemplate: crea PipelineRuns al recibir un evento de GitHub.
+# preview-url y base-url se construyen con la convención de nombres del chart:
+#   <app>-preview.<env>.svc.cluster.local → nueva versión (green / canary pods)
+#   <app>-stable.<env>.svc.cluster.local  → tráfico estable (activo)
+# El nodo cicd está tainteado; toleration + nodeSelector garantizan aislamiento.
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: pythonapps-trigger-template
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: repo-url
+  - name: app-name
+  - name: image-tag
+  - name: environment
+    default: dev
+  - name: strategy
+    default: rollingupdate
+  resourcetemplates:
+  - apiVersion: tekton.dev/v1
+    kind: PipelineRun
+    metadata:
+      generateName: $(tt.params.app-name)-run-
+      namespace: tekton-pipelines
+    spec:
+      pipelineRef:
+        name: pythonapps-pipeline
+      podTemplate:
+        tolerations:
+        - key: workload
+          value: cicd
+          operator: Equal
+          effect: NoSchedule
+        nodeSelector:
+          role: cicd
+      params:
+      - name: repo-url
+        value: $(tt.params.repo-url)
+      - name: app-name
+        value: $(tt.params.app-name)
+      - name: image-tag
+        value: $(tt.params.image-tag)
+      - name: image-full
+        value: "docker.io/{{ .Values.tekton.dockerhubUser }}/$(tt.params.app-name):$(tt.params.image-tag)"
+      - name: environment
+        value: $(tt.params.environment)
+      - name: strategy
+        value: $(tt.params.strategy)
+      - name: gitops-repo-url
+        value: "{{ .Values.tekton.gitopsRepoUrl }}"
+      - name: preview-url
+        value: "http://$(tt.params.app-name)-preview.$(tt.params.environment).svc.cluster.local:8000"
+      - name: base-url
+        value: "http://$(tt.params.app-name)-stable.$(tt.params.environment).svc.cluster.local:8000"
+      workspaces:
+      - name: source
+        volumeClaimTemplate:
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: gp3
+            resources:
+              requests:
+                storage: 2Gi
+      - name: gitops
+        volumeClaimTemplate:
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: gp3
+            resources:
+              requests:
+                storage: 1Gi

@@ -1,0 +1,35 @@
+# Services stable + preview siempre presentes, independientemente de la strategy.
+# ArgoRollouts gestiona los selectors de ambos durante cualquier tipo de rollout.
+# Esto permite cambiar de strategy entre deploys sin recrear la topología de red.
+{{- $fullname := include "pythonapps.fullname" . -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-stable
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pythonapps.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "pythonapps.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-preview
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pythonapps.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "pythonapps.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP

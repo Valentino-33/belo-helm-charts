@@ -1,0 +1,29 @@
+image:
+  tag: "latest"
+
+# Default para staging. bump-gitops lo sobreescribe con la strategy del tag en cada deploy.
+rollout:
+  strategy: canary
+
+replicas: 2
+
+resources:
+  requests:
+    cpu: "200m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+ingress:
+  enabled: true
+  hostname: api02.staging.belo-challenge.dev
+  ingressClassName: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /

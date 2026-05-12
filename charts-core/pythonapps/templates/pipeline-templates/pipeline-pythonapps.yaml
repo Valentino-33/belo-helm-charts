@@ -1,0 +1,149 @@
+# Pipeline principal para pythonapps.
+# Flujo: clone → build-push → bump-gitops → wait-argocd → load-test → promote-rollback
+#
+# La strategy viene del tag Git (refs/tags/<env>/<strategy>/<semver>).
+# load-test emite el result `outcome` (passed|failed) sin fallar el pipeline.
+# promote-rollback actúa sobre ese outcome:
+#   BlueGreen  → promote o abort según k6
+#   Canary     → promote faseado (25% → k6 → 50% → k6 → 100%) o abort
+#   Rolling    → no-op o undo según k6
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: pythonapps-pipeline
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: repo-url
+    type: string
+  - name: revision
+    type: string
+    default: main
+  - name: app-name
+    type: string
+  - name: image-tag
+    type: string
+  - name: image-full
+    type: string
+    description: "imagen completa: docker.io/user/app:tag"
+  - name: environment
+    type: string
+    default: dev
+  - name: strategy
+    type: string
+    default: rollingupdate
+  - name: gitops-repo-url
+    type: string
+  - name: preview-url
+    type: string
+    default: ""
+  - name: base-url
+    type: string
+    default: ""
+  workspaces:
+  - name: source
+  - name: gitops
+
+  tasks:
+  # Stage 1: clonar el repo de la app.
+  - name: clone
+    taskRef:
+      name: git-clone-app
+    workspaces:
+    - name: output
+      workspace: source
+    params:
+    - name: url
+      value: $(params.repo-url)
+    - name: revision
+      value: $(params.revision)
+
+  # Stage 2: build + push de la imagen con Kaniko.
+  - name: build-push
+    taskRef:
+      name: kaniko-build-push
+    runAfter: [clone]
+    workspaces:
+    - name: source
+      workspace: source
+    params:
+    - name: image
+      value: $(params.image-full)
+    - name: context
+      value: src
+
+  # Stage 3: actualiza image.tag y rollout.strategy en belo-helm-charts.
+  # El commit dispara el sync de ArgoCD en el siguiente stage.
+  - name: bump-gitops
+    taskRef:
+      name: bump-gitops-image
+    runAfter: [build-push]
+    workspaces:
+    - name: gitops
+      workspace: gitops
+    params:
+    - name: gitops-repo-url
+      value: $(params.gitops-repo-url)
+    - name: app-name
+      value: $(params.app-name)
+    - name: environment
+      value: $(params.environment)
+    - name: image-tag
+      value: $(params.image-tag)
+    - name: strategy
+      value: $(params.strategy)
+
+  # Stage 4: espera a que ArgoCD sincronice y el Rollout llegue al estado esperado.
+  # BlueGreen/Canary → Paused (nueva versión lista, sin tráfico).
+  # RollingUpdate    → Healthy (deploy completo, listo para smoke test).
+  - name: wait-argocd
+    taskRef:
+      name: wait-argocd-sync
+    runAfter: [bump-gitops]
+    params:
+    - name: app-name
+      value: $(params.app-name)
+    - name: environment
+      value: $(params.environment)
+    - name: strategy
+      value: $(params.strategy)
+
+  # Stage 5: corre k6 contra la versión nueva (aislada o mezclada según strategy).
+  # Emite el result `outcome` — nunca falla el pipeline directamente.
+  - name: load-test
+    taskRef:
+      name: run-load-test
+    runAfter: [wait-argocd]
+    workspaces:
+    - name: source
+      workspace: source
+    params:
+    - name: app-name
+      value: $(params.app-name)
+    - name: strategy
+      value: $(params.strategy)
+    - name: preview-url
+      value: $(params.preview-url)
+    - name: base-url
+      value: $(params.base-url)
+
+  # Stage 6: promueve o revierte según el outcome de k6.
+  # Es el único punto donde el deploy se "confirma" o se deshace.
+  - name: promote-rollback
+    taskRef:
+      name: promote-rollback
+    runAfter: [load-test]
+    workspaces:
+    - name: source
+      workspace: source
+    params:
+    - name: app-name
+      value: $(params.app-name)
+    - name: environment
+      value: $(params.environment)
+    - name: strategy
+      value: $(params.strategy)
+    - name: outcome
+      value: $(tasks.load-test.results.outcome)
+    - name: preview-url
+      value: $(params.preview-url)

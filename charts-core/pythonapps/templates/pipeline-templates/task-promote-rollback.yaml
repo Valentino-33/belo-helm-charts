@@ -1,0 +1,178 @@
+# Promoción o rollback automático basado en el outcome del load test.
+#
+# BlueGreen:
+#   passed → argo rollouts promote  (switch de tráfico green→stable)
+#   failed → argo rollouts abort    (destruye el green, tráfico vuelve al blue)
+#
+# Canary (promoción faseada con k6 entre cada paso):
+#   5%→passed → promote (25%) → k6 → 25%→passed → promote (50%) → k6 → 50%→passed → promote --full
+#   cualquier fallo → argo rollouts abort (rollback inmediato al stable)
+#
+# RollingUpdate:
+#   passed → no-op (deploy ya completado al 100%)
+#   failed → argo rollouts undo (revierte al ReplicaSet anterior)
+#
+# En producción, reemplazar las descargas dinámicas de binarios por una imagen
+# custom que los incluya: docker.io/<org>/tekton-tools:latest
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: promote-rollback
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: app-name
+    type: string
+  - name: environment
+    type: string
+  - name: strategy
+    type: string
+    default: rollingupdate
+  - name: outcome
+    type: string
+    description: "'passed' | 'failed' — viene del result de run-load-test"
+  - name: preview-url
+    type: string
+    default: ""
+    description: "URL del service preview para k6 en fases Canary 25% y 50%"
+  workspaces:
+  - name: source
+    description: "Workspace con src/loadtest/ para k6 en fases intermedias Canary"
+  steps:
+  # Descarga kubectl-argo-rollouts y k6 al workspace.
+  # En un pipeline de producción estos binarios estarían en una imagen custom.
+  - name: download-tools
+    image: curlimages/curl:latest
+    script: |
+      #!/bin/sh
+      set -e
+      BIN="$(workspaces.source.path)/bin"
+      mkdir -p "$BIN"
+
+      echo "Descargando kubectl-argo-rollouts..."
+      curl -sSL \
+        "https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64" \
+        -o "$BIN/argo-rollouts"
+      chmod +x "$BIN/argo-rollouts"
+
+      echo "Descargando k6..."
+      K6_VER="v0.55.0"
+      curl -sSL \
+        "https://github.com/grafana/k6/releases/download/${K6_VER}/k6-${K6_VER}-linux-amd64.tar.gz" \
+        | tar -xz --strip-components=1 -C "$BIN" "k6-${K6_VER}-linux-amd64/k6"
+      chmod +x "$BIN/k6"
+
+      echo "Herramientas listas:"
+      ls -la "$BIN/"
+
+  # Lógica principal: promote o rollback según strategy y outcome.
+  - name: promote-or-rollback
+    image: bitnami/kubectl:latest
+    script: |
+      #!/bin/bash
+      set -e
+      BIN="$(workspaces.source.path)/bin"
+      ARGO="$BIN/argo-rollouts"
+      K6="$BIN/k6"
+      APP="$(params.app-name)"
+      NS="$(params.environment)"
+      OUTCOME="$(params.outcome)"
+      STRATEGY=$(echo "$(params.strategy)" | tr '[:upper:]' '[:lower:]')
+      PREVIEW_URL="$(params.preview-url)"
+      K6_SCRIPT="$(workspaces.source.path)/src/loadtest/load-canary.js"
+
+      echo "=== promote-rollback: app=$APP ns=$NS strategy=$STRATEGY outcome=$OUTCOME ==="
+
+      # ────────────────────────────────────────────────────────────
+      # BLUEGREEN
+      # ────────────────────────────────────────────────────────────
+      if [ "$STRATEGY" = "bluegreen" ]; then
+        if [ "$OUTCOME" = "passed" ]; then
+          echo "BlueGreen: k6 PASSED → promoviendo green a stable..."
+          "$ARGO" promote "$APP" -n "$NS"
+          echo "BlueGreen: tráfico switcheado a la nueva versión."
+        else
+          echo "BlueGreen: k6 FAILED → abortando, destruyendo green..."
+          "$ARGO" abort "$APP" -n "$NS"
+          echo "BlueGreen: rollback completo. Stable intacto."
+          exit 1
+        fi
+
+      # ────────────────────────────────────────────────────────────
+      # CANARY — promoción faseada con k6 entre cada paso
+      # ────────────────────────────────────────────────────────────
+      elif [ "$STRATEGY" = "canary" ]; then
+        if [ "$OUTCOME" = "failed" ]; then
+          echo "Canary: k6 FAILED en 5% → abortando..."
+          "$ARGO" abort "$APP" -n "$NS"
+          echo "Canary: rollback completo."
+          exit 1
+        fi
+
+        # Función auxiliar: corre k6 y retorna exit code.
+        run_k6_phase() {
+          local phase="$1"
+          echo "  --- k6 en fase $phase% ---"
+          if [ ! -f "$K6_SCRIPT" ]; then
+            echo "  WARN: $K6_SCRIPT no existe — fase $phase% marcada como passed"
+            return 0
+          fi
+          "$K6" run -e TARGET_URL="$PREVIEW_URL" "$K6_SCRIPT"
+          return $?
+        }
+
+        # Función auxiliar: espera que el Rollout vuelva a Paused (siguiente pause:{}).
+        wait_paused() {
+          local max=120
+          local elapsed=0
+          until [ "$(kubectl get rollout "$APP" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Paused" ]; do
+            if [ $elapsed -ge $max ]; then
+              echo "ERROR: Timeout esperando Rollout Paused tras promote"
+              return 1
+            fi
+            sleep 5
+            elapsed=$((elapsed + 5))
+          done
+          echo "  Rollout Paused — ok"
+        }
+
+        # Fase 25%
+        echo "Canary: k6 pasó al 5% → promoviendo a 25%..."
+        "$ARGO" promote "$APP" -n "$NS"
+        wait_paused
+        if ! run_k6_phase 25; then
+          echo "Canary: k6 FAILED en 25% → abortando..."
+          "$ARGO" abort "$APP" -n "$NS"
+          exit 1
+        fi
+
+        # Fase 50%
+        echo "Canary: k6 pasó al 25% → promoviendo a 50%..."
+        "$ARGO" promote "$APP" -n "$NS"
+        wait_paused
+        if ! run_k6_phase 50; then
+          echo "Canary: k6 FAILED en 50% → abortando..."
+          "$ARGO" abort "$APP" -n "$NS"
+          exit 1
+        fi
+
+        # Fase 100% — todas las fases pasaron
+        echo "Canary: k6 pasó al 50% → promoviendo a 100%..."
+        "$ARGO" promote --full "$APP" -n "$NS"
+        echo "Canary: nueva versión en producción al 100%."
+
+      # ────────────────────────────────────────────────────────────
+      # ROLLINGUPDATE
+      # ────────────────────────────────────────────────────────────
+      else
+        if [ "$OUTCOME" = "passed" ]; then
+          echo "RollingUpdate: smoke test PASSED — deploy completo."
+        else
+          echo "RollingUpdate: smoke test FAILED → revirtiendo al ReplicaSet anterior..."
+          "$ARGO" undo "$APP" -n "$NS"
+          echo "RollingUpdate: rollback iniciado."
+          exit 1
+        fi
+      fi
+
+      echo "=== promote-rollback completado con éxito ==="

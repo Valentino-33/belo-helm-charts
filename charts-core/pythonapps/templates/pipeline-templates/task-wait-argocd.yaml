@@ -1,0 +1,97 @@
+# Espera a que ArgoCD sincronice la Application y el Rollout llegue al estado esperado.
+# Para BlueGreen y Canary: espera "Paused" (nueva versión lista, sin tráfico real aún).
+# Para RollingUpdate: espera "Healthy" (deploy completo, listo para smoke test).
+# Timeout de 10 minutos — si no converge, falla el pipeline para evitar tests ciegos.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: wait-argocd-sync
+  namespace: tekton-pipelines
+spec:
+  params:
+  - name: app-name
+    type: string
+  - name: environment
+    type: string
+  - name: strategy
+    type: string
+    default: rollingupdate
+  - name: timeout-seconds
+    default: "600"
+    type: string
+  steps:
+  - name: wait-argocd
+    image: bitnami/kubectl:latest
+    script: |
+      #!/bin/bash
+      set -e
+      ARGOAPP="$(params.app-name)-$(params.environment)"
+      TIMEOUT=$(params.timeout-seconds)
+      ELAPSED=0
+
+      echo "=== Esperando sync de ArgoCD Application: $ARGOAPP ==="
+
+      # Espera que la Application exista (puede tardar unos segundos en aparecer).
+      until kubectl get application "$ARGOAPP" -n argocd > /dev/null 2>&1; do
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "ERROR: Timeout esperando que exista la Application $ARGOAPP"
+          exit 1
+        fi
+        echo "  Application no encontrada aún, reintentando en 10s... (${ELAPSED}s/${TIMEOUT}s)"
+        sleep 10
+        ELAPSED=$((ELAPSED + 10))
+      done
+
+      # Espera sync.status = Synced
+      until [ "$(kubectl get application "$ARGOAPP" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null)" = "Synced" ]; do
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "ERROR: Timeout esperando ArgoCD Synced"
+          kubectl get application "$ARGOAPP" -n argocd -o jsonpath='{.status.sync.status}'
+          exit 1
+        fi
+        echo "  Sync status: $(kubectl get application "$ARGOAPP" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null | tr -d '\n') — esperando... (${ELAPSED}s/${TIMEOUT}s)"
+        sleep 10
+        ELAPSED=$((ELAPSED + 10))
+      done
+      echo "  ArgoCD: Synced"
+
+      # Espera health.status = Healthy (ArgoCD nivel app, no necesariamente Rollout nivel).
+      until [ "$(kubectl get application "$ARGOAPP" -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null)" = "Healthy" ]; do
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "ERROR: Timeout esperando ArgoCD Healthy"
+          exit 1
+        fi
+        echo "  Health status: $(kubectl get application "$ARGOAPP" -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null | tr -d '\n') — esperando... (${ELAPSED}s/${TIMEOUT}s)"
+        sleep 10
+        ELAPSED=$((ELAPSED + 10))
+      done
+      echo "  ArgoCD: Healthy"
+
+      # Espera el estado esperado del Rollout según la strategy.
+      STRATEGY=$(echo "$(params.strategy)" | tr '[:upper:]' '[:lower:]')
+      NS="$(params.environment)"
+      APP="$(params.app-name)"
+
+      if [ "$STRATEGY" = "rollingupdate" ]; then
+        TARGET_PHASE="Healthy"
+      else
+        # bluegreen y canary pausan antes de necesitar promoción.
+        TARGET_PHASE="Paused"
+      fi
+
+      echo "=== Esperando Rollout/$APP en namespace $NS — fase esperada: $TARGET_PHASE ==="
+      until [ "$(kubectl get rollout "$APP" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)" = "$TARGET_PHASE" ]; do
+        PHASE=$(kubectl get rollout "$APP" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null | tr -d '\n')
+        if [ "$PHASE" = "Degraded" ]; then
+          echo "ERROR: Rollout en estado Degraded — abortando pipeline"
+          exit 1
+        fi
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "ERROR: Timeout esperando Rollout fase $TARGET_PHASE (actual: $PHASE)"
+          exit 1
+        fi
+        echo "  Rollout fase: ${PHASE:-desconocida} — esperando $TARGET_PHASE... (${ELAPSED}s/${TIMEOUT}s)"
+        sleep 10
+        ELAPSED=$((ELAPSED + 10))
+      done
+      echo "=== Rollout en fase $TARGET_PHASE — listo para load test ==="

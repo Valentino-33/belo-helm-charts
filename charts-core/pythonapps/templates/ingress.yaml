@@ -1,0 +1,51 @@
+# Ingress stable (tráfico activo) + preview (nueva versión, acceso aislado para tests).
+# Ambos siempre presentes. Para bluegreen/canary ArgoRollouts manipula el weight
+# de stable. Para rollingupdate, el tráfico va 100% a stable desde el inicio.
+{{- if .Values.ingress.enabled }}
+{{- $fullname := include "pythonapps.fullname" . -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}-stable
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pythonapps.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.ingressClassName }}
+  rules:
+  - host: {{ .Values.ingress.hostname }}
+    http:
+      paths:
+      - path: /{{ .Values.app.pathPrefix }}
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ $fullname }}-stable
+            port:
+              number: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}-preview
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pythonapps.labels" . | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.ingressClassName }}
+  rules:
+  - host: preview-{{ .Values.ingress.hostname }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ $fullname }}-preview
+            port:
+              number: 8000
+{{- end }}

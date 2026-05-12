@@ -1,0 +1,20 @@
+# Valores fijos para webserver-api02 — no varían por ambiente ni por deploy.
+# rollout.strategy NO está acá: se determina en el tag Git y se escribe en
+# el values de cada ambiente por bump-gitops en cada pipeline run.
+# Combinar con: helm template api02 pythonapps/ -f build-time/app.yaml -f <env>/values.yaml
+app:
+  name: webserver-api02
+  pathPrefix: api02
+  metricsPath: /api02/metrics
+
+image:
+  repository: docker.io/valentinobruno/api02
+  pullPolicy: IfNotPresent
+
+tekton:
+  dockerhubUser: valentinobruno
+  gitopsRepoUrl: https://github.com/Valentino-33/belo-helm-charts
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
